@@ -1088,8 +1088,32 @@ function savePurchaseEditInline(rowKey) {
     items.push({ id: genId(), name: nm, qty, desc });
   });
   if (!items.length) return;
-  if (newName) customer.name = newName;
-  customer.purchases = (customer.purchases || []).map(p => p.id === purchaseId ? { ...p, date, time, note, items } : p);
+
+  const original = (customer.purchases || []).find(p => p.id === purchaseId);
+  const updatedPurchase = { ...original, date, time, note, items };
+
+  // Renaming must never rename the shared customer record — that would silently
+  // relabel every OTHER sale bucketed under the same name too (e.g. two unrelated
+  // sales both temporarily named "مغازه"). If the name actually changed, move just
+  // THIS sale out to whichever customer record matches the new name (an existing
+  // one, or a brand-new one), leaving the rest of that customer's sales untouched.
+  const nameChanged = newName && normalizeFa(newName) !== normalizeFa(customer.name);
+  if (!nameChanged) {
+    customer.purchases = (customer.purchases || []).map(p => p.id === purchaseId ? updatedPurchase : p);
+  } else {
+    customer.purchases = (customer.purchases || []).filter(p => p.id !== purchaseId);
+    if (!customer.purchases.length) {
+      state.customers = state.customers.filter(c => c.id !== customer.id);
+    }
+    const normNew = normalizeFa(newName);
+    let target = state.customers.find(c => c.id !== customer.id && normalizeFa(c.name) === normNew);
+    if (!target) {
+      target = { id: genId(), name: newName, createdAt: Date.now(), purchases: [] };
+      state.customers = [target, ...state.customers];
+    }
+    target.purchases = [updatedPurchase, ...(target.purchases || [])];
+  }
+
   state.editingPurchase = null;
   persist();
   renderList();
