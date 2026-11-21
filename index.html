@@ -211,13 +211,13 @@ function b64ToBuf(b64) {
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer;
 }
-async function deriveKey(passphrase, saltB64) {
+async function deriveKey(passphrase, saltB64, alg = "AES-GCM") {
   const enc = new TextEncoder();
   const salt = b64ToBuf(saltB64);
   const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: 150000, hash: "SHA-256" },
-    keyMaterial, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+    keyMaterial, { name: alg, length: 256 }, false, ["encrypt", "decrypt"]
   );
 }
 async function encryptJSON(key, dataObj) {
@@ -282,6 +282,79 @@ function parseBackupText(raw) {
     if (!obj.salt || !obj.iv || !obj.data) fail("format");
     return obj;
   } catch (err) { fail(err.code || "damaged"); }
+}
+
+// ---------- partial recovery from a cut-off / damaged backup ----------
+// AES-GCM encrypts like a stream: the start of the ciphertext can still be decrypted even when the
+// end (and the integrity tag) is missing. Customers are stored newest-first, so a cut-off backup
+// still holds the newest customers; only the oldest ones at the cut-off end are lost.
+const INVISIBLES = /[​-‏‪-‮⁦-⁩﻿ ]/g;
+
+function b64PrefixToBytes(b64) {
+  let s = (b64 || "").replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/]/g, "");
+  if (s.length % 4 === 1) s = s.slice(0, -1);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function extractBackupFields(rawText) {
+  let t = (rawText || "").replace(INVISIBLES, "").replace(/[“”„‟«»]/g, '"').replace(/\s+/g, "");
+  const at = t.indexOf("AB1.");
+  if (at !== -1) {
+    // new-format token: the JSON is base64-wrapped; decode as much of it as is intact
+    let rest = t.slice(at + 4).replace(/[^A-Za-z0-9_.\-]/g, "");
+    const dot = rest.lastIndexOf(".");
+    if (dot !== -1 && /^[0-9a-f]{0,8}$/.test(rest.slice(dot + 1))) rest = rest.slice(0, dot);
+    const bytes = b64PrefixToBytes(rest);
+    t = Array.from(bytes, b => String.fromCharCode(b)).join("");
+  }
+  const salt = (t.match(/"salt":"([A-Za-z0-9+/=_\-]+)"/) || [])[1];
+  const iv = (t.match(/"iv":"([A-Za-z0-9+/=_\-]+)"/) || [])[1];
+  const data = (t.match(/"data":"([A-Za-z0-9+/=_\-]*)/) || [])[1];
+  return { salt, iv, data };
+}
+
+function extractCompleteCustomers(txt) {
+  const m = txt.match(/"customers":\s*\[/);
+  if (!m) return [];
+  let i = m.index + m[0].length;
+  const out = [];
+  while (i < txt.length) {
+    while (i < txt.length && /[\s,]/.test(txt[i])) i++;
+    if (txt[i] !== "{") break;
+    let depth = 0, inStr = false, esc = false, j = i;
+    for (; j < txt.length; j++) {
+      const ch = txt[j];
+      if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; }
+      else if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) break; }
+    }
+    if (j >= txt.length) break; // last object is cut off — drop it
+    try {
+      const o = JSON.parse(txt.slice(i, j + 1));
+      if (!o || typeof o.name !== "string" || typeof o.code !== "string") break;
+      out.push(o);
+    } catch { break; }
+    i = j + 1;
+  }
+  return out;
+}
+
+// Returns { salt, customers, passwordOk }. Never throws for "wrong password" — passwordOk=false instead.
+async function recoverPartialBackup(rawText, pass) {
+  const f = extractBackupFields(rawText);
+  if (!f.salt || !f.iv || !f.data) { const e = new Error("unrecoverable"); e.code = "unrecoverable"; throw e; }
+  const key = await deriveKey(pass, f.salt, "AES-CTR");
+  const iv = new Uint8Array(b64ToBuf(f.iv));
+  const counter = new Uint8Array(16); counter.set(iv, 0); counter[15] = 2; // GCM's first data block
+  const cipher = b64PrefixToBytes(f.data);
+  const plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-CTR", counter, length: 32 }, key, cipher));
+  const txt = new TextDecoder().decode(plain);
+  const passwordOk = /^\{"customers":\s*\[/.test(txt);
+  return { salt: f.salt, customers: passwordOk ? extractCompleteCustomers(txt) : [], passwordOk };
 }
 
 function formatPersianDate(isoDate) {
@@ -714,7 +787,31 @@ async function handleRestoreFromText() {
     } else if (e.code === "format") {
       state.error = "این متن، متن پشتیبان این برنامه نیست.";
     } else {
-      state.error = "متن پشتیبان ناقصه یا خراب شده (احتمالاً موقع ذخیره یا کپی، آخرش بریده شده). از اول تا آخرِ متن رو کامل کپی کن و دوباره پیست کن.";
+      // text is cut off or damaged — try to rescue as many customers as possible from what is there
+      let rescued = null;
+      try { rescued = await recoverPartialBackup(backupTextRaw, pass); } catch { rescued = null; }
+      if (rescued && rescued.passwordOk && rescued.customers.length > 0) {
+        const key = await deriveKey(pass, rescued.salt);
+        state.key = key; state.salt = rescued.salt;
+        state.customers = rescued.customers;
+        state.usedCodes = rescued.customers.map(c => c.code);
+        state.showRestore = false;
+        state.phase = "unlocked";
+        localStorage.setItem(SALT_KEY, rescued.salt);
+        persist();
+        state.rememberMe = document.getElementById("rememberChk") ? document.getElementById("rememberChk").checked : false;
+        if (state.rememberMe) localStorage.setItem(REMEMBER_KEY, pass); else localStorage.removeItem(REMEMBER_KEY);
+        state.busy = false;
+        render();
+        alert("متن پشتیبان ناقص بود، ولی " + rescued.customers.length + " مشتری (جدیدترین‌ها) برگردونده شد. مشتری‌های قدیمی‌تر که توی بخشِ بریده‌شده بودن قابل بازیابی نیستن. همین الان «کپی پشتیبان» رو بزن و متن کامل رو جایی امن نگه‌دار.");
+        return;
+      } else if (rescued && !rescued.passwordOk) {
+        state.error = "متن پشتیبان ناقصه و رمز هم با اون نمی‌خونه. اول مطمئن شو رمز درسته (حروف بزرگ/کوچیک مهمه)، بعد دوباره امتحان کن.";
+      } else if (rescued && rescued.customers.length === 0) {
+        state.error = "متن پشتیبان اون‌قدر کوتاه شده که هیچ مشتری کاملی توش نمونده.";
+      } else {
+        state.error = "متن پشتیبان ناقصه یا خراب شده و از اول (قسمت رمزگذاری) هم آسیب دیده؛ چیزی ازش قابل بازیابی نیست. اگه کپی کامل‌ترش جایی (تلگرام، یادداشت دیگه، کلیپ‌بورد) هست از اون استفاده کن.";
+      }
     }
   }
   state.busy = false;
